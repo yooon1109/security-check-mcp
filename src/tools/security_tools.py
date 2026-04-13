@@ -39,6 +39,39 @@ AUTH_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ("인증 없는 admin 라우트",    re.compile(r'(app|router)\.(get|post|put|delete)\s*\(["\']\/admin', re.IGNORECASE), "MEDIUM"),
 ]
 
+# 에러 응답에 스택 트레이스 노출
+ERROR_EXPOSURE_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("에러 스택 트레이스 노출",   re.compile(r'(res|response)\.(json|send)\s*\([^)]*\bstack\b', re.IGNORECASE),           "HIGH"),
+    ("에러 메시지 직접 노출",     re.compile(r'(res|response)\.(json|send)\s*\([^)]*err(or)?\.message', re.IGNORECASE),   "MEDIUM"),
+    ("민감 정보 로그 (Java)",     re.compile(r'log\.(info|debug|warn)\s*\([^)]*password', re.IGNORECASE),                 "HIGH"),
+    ("민감 정보 로그 (Python)",   re.compile(r'(logger|logging)\.(info|debug|warning)\s*\([^)]*password', re.IGNORECASE), "HIGH"),
+]
+
+# Rate Limiting 없는 인증 라우트
+RATE_LIMIT_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("로그인 라우트 Rate Limit 미적용 가능성", re.compile(r'(app|router)\.(post)\s*\(["\'].*(login|signin|auth)["\'](?!.*limit)', re.IGNORECASE), "MEDIUM"),
+    ("비밀번호 재설정 Rate Limit 미적용 가능성", re.compile(r'(app|router)\.(post)\s*\(["\'].*(password|reset|forgot)["\'](?!.*limit)', re.IGNORECASE), "MEDIUM"),
+]
+
+# 파일 업로드 취약점
+FILE_UPLOAD_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("파일 확장자 검증 없는 업로드",  re.compile(r'(multer|upload|diskStorage)\s*\([^)]*\)', re.IGNORECASE),                    "MEDIUM"),
+    ("파일명 직접 사용",              re.compile(r'(writeFile|createWriteStream)\s*\([^)]*req\.(body|file|files)', re.IGNORECASE), "HIGH"),
+    ("경로 탈출 가능성",              re.compile(r'path\.(join|resolve)\s*\([^)]*req\.(body|params|query)', re.IGNORECASE),        "HIGH"),
+]
+
+# JWT / 인증 처리 오류
+JWT_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("jwt.decode 사용 (검증 없음)", re.compile(r'jwt\.decode\s*\(', re.IGNORECASE), "HIGH"),
+    ("응답에 password 필드 포함",   re.compile(r'(res|response)\.(json|send)\s*\(\s*(await\s+)?\w*(user|member|account)\b(?!.*select)', re.IGNORECASE), "MEDIUM"),
+]
+
+# IDOR (수평적 권한 상승) 가능성
+IDOR_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("소유자 검증 없는 단건 조회 가능성", re.compile(r'findById\s*\(\s*req\.(params|query|body)\.id\s*\)', re.IGNORECASE), "MEDIUM"),
+    ("소유자 검증 없는 단건 조회 가능성 (JPA)", re.compile(r'findById\s*\(\s*(id|userId|resourceId)\s*\)(?!.*UserId|.*owner)', re.IGNORECASE), "MEDIUM"),
+]
+
 ENV_GITIGNORE_FILES = {".env", ".env.local", ".env.production", ".env.development"}
 CODE_EXTENSIONS = {".js", ".ts", ".jsx", ".tsx", ".py", ".java", ".kt", ".go"}
 
@@ -194,14 +227,24 @@ def register_security_tools(mcp: FastMCP) -> None:
             and (not skip_test_files or not _is_test_file(f))
         ]
 
-        secret_findings    = _scan_patterns(all_files, SECRET_PATTERNS)
-        console_findings   = _scan_patterns(all_files, CONSOLE_PATTERNS)
-        injection_findings = _scan_patterns(all_files, INJECTION_PATTERNS)
-        auth_findings      = _scan_patterns(all_files, AUTH_PATTERNS)
-        env_findings       = _check_env_gitignore(base)
-        npm_audit_result   = _run_npm_audit(base)
+        secret_findings       = _scan_patterns(all_files, SECRET_PATTERNS)
+        console_findings      = _scan_patterns(all_files, CONSOLE_PATTERNS)
+        injection_findings    = _scan_patterns(all_files, INJECTION_PATTERNS)
+        auth_findings         = _scan_patterns(all_files, AUTH_PATTERNS)
+        error_findings        = _scan_patterns(all_files, ERROR_EXPOSURE_PATTERNS)
+        rate_limit_findings   = _scan_patterns(all_files, RATE_LIMIT_PATTERNS)
+        file_upload_findings  = _scan_patterns(all_files, FILE_UPLOAD_PATTERNS)
+        jwt_findings          = _scan_patterns(all_files, JWT_PATTERNS)
+        idor_findings         = _scan_patterns(all_files, IDOR_PATTERNS)
+        env_findings          = _check_env_gitignore(base)
+        npm_audit_result      = _run_npm_audit(base)
 
-        all_findings = secret_findings + env_findings + injection_findings + auth_findings + console_findings
+        all_findings = (
+            secret_findings + env_findings + injection_findings
+            + auth_findings + error_findings + rate_limit_findings
+            + file_upload_findings + jwt_findings + idor_findings
+            + console_findings
+        )
         high   = [f for f in all_findings if f["severity"] == "HIGH"]
         medium = [f for f in all_findings if f["severity"] == "MEDIUM"]
         low    = [f for f in all_findings if f["severity"] == "LOW"]
