@@ -5,5 +5,23 @@ description = "코드베이스 보안 취약점 점검 MCP 서버"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "mcp>=1.27.0",
+    "mcp[cli]>=1.27.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[project.scripts]
+security-check-mcp = "src.server:mcp"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
 ]
