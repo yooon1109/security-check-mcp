@@ -33,8 +33,25 @@
 - 비개발자도 읽기 쉬운 한국어 리포트
 - `출시 차단 / 수정 후 재점검 / 기본 점검 통과` 판정 제공
 - 코드, 응답 헤더, 쿠키, 공개 경로, 인증 후 권한 문제까지 함께 점검
-- Express, Next.js, Django, Flask, FastAPI, Spring, NestJS, Rails, Laravel 등 대표적인 프레임워크 힌트 감지
+- 프레임워크와 무관한 공통 위험 패턴 점검
+- Express, Next.js, Django, Flask, FastAPI, Spring, NestJS, Rails, Laravel 등 일부 프레임워크 대표 설정 실수 점검
 - 공격자 관점의 위험 설명 포함
+
+## 지원 범위
+
+이 MCP는 모든 프레임워크 프로젝트에 대해 기본적인 공통 보안 패턴을 점검할 수 있습니다.
+
+프레임워크와 무관하게 주로 보는 항목은 아래와 같습니다.
+
+- 코드에 직접 들어간 API 키, 비밀번호, 토큰, DB URL, private key
+- SQL Injection, Command Injection, SSRF로 이어질 수 있는 위험 패턴
+- `eval`, `exec`, 민감정보 로그, 디버그 설정
+- CORS 전체 허용, JWT localStorage 저장, 쿠키 보안 속성 누락 가능성
+- `.gitignore`와 `.env` 관리 실수
+
+다만 모든 프레임워크의 보안 설정과 권한 모델을 100% 검증하지는 않습니다.
+
+프레임워크 특화 점검은 현재 Django, Flask, FastAPI, Spring, Next.js, Express/NestJS/Fastify, Rails, Laravel 쪽의 대표적인 설정 실수 위주입니다. 그 외 프레임워크는 공통 패턴 점검 중심으로 동작합니다.
 
 ## 제공하는 Tool
 
@@ -85,6 +102,17 @@
 - 일반 사용자로 관리자 경로 접근 가능성
 - 로그인된 상태에서 타인 ID 데이터 접근 가능성
 
+### `export_report`
+
+점검 도구가 반환한 Markdown 리포트를 파일로 저장합니다.
+
+주요 입력:
+
+- `report_content`: 저장할 리포트 내용
+- `output_path`: 저장할 파일 경로
+- `overwrite`: 기존 파일 덮어쓰기 여부. 기본값은 `false`
+- `allowed_base_path`: 값이 있으면 해당 workspace 내부 경로에만 저장
+
 ## 리포트 형식
 
 리포트는 대체로 다음 구조를 따릅니다.
@@ -115,6 +143,8 @@
 
 ## 한계
 
+이 도구는 보안 사전 점검 보조 도구입니다. `기본 점검 통과`가 실제 서비스의 안전을 보증하지는 않습니다.
+
 이 도구가 모든 프레임워크를 100% 완전하게 검증하는 것은 아닙니다.
 
 특히 아래는 자동 점검만으로 완전하게 증명하기 어렵습니다.
@@ -124,6 +154,8 @@
 - 실제 결제/주문/정산 플로우 전체
 - 인프라 내부망 정책, WAF, CDN, 클라우드 IAM 구성 전체
 - 테스트 계정 없이는 재현이 어려운 세밀한 권한 문제
+- GraphQL, WebSocket, 파일 다운로드, 웹훅, 업로드 후 처리처럼 서비스별 맥락이 큰 흐름
+- Python, Java, Ruby, PHP, Go, Rust 등 npm 외 생태계의 전체 의존성 취약점
 
 즉, 이 MCP는 출시 전 1차/2차 방어선에는 적합하지만, 이것만으로 절대 안전하다고 결론 내리면 안 됩니다.
 
@@ -143,6 +175,68 @@ uv run python src/server.py
 
 ```bash
 uv run security-check-mcp
+```
+
+MCP 클라이언트에 등록할 때는 아래처럼 설정할 수 있습니다.
+
+```json
+{
+  "mcpServers": {
+    "security-check": {
+      "command": "uv",
+      "args": [
+        "run",
+        "security-check-mcp"
+      ],
+      "cwd": "/Users/yoonsu/Documents/GitHub/security-check-mcp"
+    }
+  }
+}
+```
+
+직접 Python 파일을 실행하는 방식으로 등록해도 됩니다.
+
+```json
+{
+  "mcpServers": {
+    "security-check": {
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "/Users/yoonsu/Documents/GitHub/security-check-mcp/src/server.py"
+      ],
+      "cwd": "/Users/yoonsu/Documents/GitHub/security-check-mcp"
+    }
+  }
+}
+```
+
+## 사용 순서
+
+1. `check_security`로 로컬 프로젝트 디렉터리를 정적 점검합니다.
+2. 배포 URL이 있으면 `check_live_security`로 실제 응답 헤더와 쿠키를 확인합니다.
+3. `check_attack_surface`로 공개 관리자 경로, 문서 경로, 순차 ID 노출 신호를 확인합니다.
+4. 테스트용 일반 사용자 계정이 있으면 `check_authenticated_flows`로 관리자 접근과 IDOR 가능성을 확인합니다.
+
+예시 입력:
+
+```text
+check_security(base_path="/path/to/project", skip_test_files=true)
+check_live_security(target_url="https://example.com")
+check_attack_surface(target_url="https://example.com")
+check_authenticated_flows(
+  target_url="https://example.com",
+  bearer_token="일반 사용자 토큰",
+  reference_user_id="1",
+  alternate_user_id="2"
+)
+export_report(
+  report_content="check_security 또는 다른 점검 도구가 반환한 리포트",
+  output_path="/path/to/project/security-report.md",
+  overwrite=true,
+  allowed_base_path="/path/to/project"
+)
 ```
 
 ## 테스트
