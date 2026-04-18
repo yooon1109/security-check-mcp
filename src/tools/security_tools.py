@@ -1418,6 +1418,50 @@ def analyze_project(base_path: str, skip_test_files: bool = True) -> str:
     return "\n".join(sections).strip()
 
 
+def _resolve_path_for_write(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve(strict=False)
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def export_report_to_file(
+    report_content: str,
+    output_path: str,
+    overwrite: bool = False,
+    allowed_base_path: str = "",
+) -> str:
+    if not report_content or not report_content.strip():
+        return "오류: 저장할 리포트 내용이 비어 있습니다."
+    if not output_path or not output_path.strip():
+        return "오류: 저장할 파일 경로가 비어 있습니다."
+
+    destination = _resolve_path_for_write(output_path)
+    if allowed_base_path:
+        allowed_base = _resolve_path_for_write(allowed_base_path)
+        if not allowed_base.exists() or not allowed_base.is_dir():
+            return f"오류: 허용된 workspace 경로가 유효하지 않습니다 - {allowed_base}"
+        if not _is_relative_to(destination, allowed_base):
+            return f"오류: 리포트는 허용된 workspace 내부에만 저장할 수 있습니다 - {allowed_base}"
+
+    if destination.exists() and not overwrite:
+        return f"오류: 파일이 이미 존재합니다 - {destination}"
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        content = report_content.rstrip() + "\n"
+        destination.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return f"오류: 리포트를 저장하지 못했습니다 - {destination} ({exc})"
+
+    return f"리포트 저장 완료: {destination}"
+
+
 def register_security_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def check_security(base_path: str, skip_test_files: bool = True) -> str:
@@ -1499,4 +1543,32 @@ def register_security_tools(mcp: FastMCP) -> None:
             reference_user_id=reference_user_id,
             alternate_user_id=alternate_user_id,
             timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool()
+    def export_report(
+        report_content: str,
+        output_path: str,
+        overwrite: bool = False,
+        allowed_base_path: str = "",
+    ) -> str:
+        """
+        점검 도구가 반환한 Markdown 리포트 문자열을 파일로 저장한다.
+
+        Parameters
+        ----------
+        report_content : str
+            저장할 보안 점검 리포트 내용
+        output_path : str
+            저장할 Markdown 파일 경로
+        overwrite : bool
+            False면 기존 파일이 있을 때 덮어쓰지 않는다.
+        allowed_base_path : str
+            값이 있으면 이 디렉터리 내부에만 리포트를 저장한다.
+        """
+        return export_report_to_file(
+            report_content=report_content,
+            output_path=output_path,
+            overwrite=overwrite,
+            allowed_base_path=allowed_base_path,
         )

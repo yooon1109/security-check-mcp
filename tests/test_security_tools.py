@@ -7,6 +7,7 @@ from src.tools.security_tools import (
     analyze_authenticated_flows,
     analyze_live_service,
     analyze_project,
+    export_report_to_file,
 )
 
 
@@ -274,3 +275,80 @@ def test_analyze_authenticated_flows_requires_auth_context() -> None:
     report = analyze_authenticated_flows("https://example.com")
 
     assert report.startswith("오류: 인증 기반 점검에는")
+
+
+def test_export_report_to_file_writes_markdown_report(tmp_path: Path) -> None:
+    output_path = tmp_path / "reports" / "security-report.md"
+
+    result = export_report_to_file(
+        report_content="# 보안 점검 리포트\n\n- 출시 판정: 기본 점검 통과",
+        output_path=str(output_path),
+    )
+
+    assert output_path.read_text(encoding="utf-8") == "# 보안 점검 리포트\n\n- 출시 판정: 기본 점검 통과\n"
+    assert "리포트 저장 완료" in result
+    assert str(output_path) in result
+
+
+def test_export_report_to_file_rejects_empty_report(tmp_path: Path) -> None:
+    output_path = tmp_path / "security-report.md"
+
+    result = export_report_to_file(report_content="   ", output_path=str(output_path))
+
+    assert result.startswith("오류: 저장할 리포트 내용이 비어 있습니다")
+    assert not output_path.exists()
+
+
+def test_export_report_to_file_does_not_overwrite_by_default(tmp_path: Path) -> None:
+    output_path = tmp_path / "security-report.md"
+    output_path.write_text("existing\n", encoding="utf-8")
+
+    result = export_report_to_file(report_content="new report", output_path=str(output_path))
+
+    assert result.startswith("오류: 파일이 이미 존재합니다")
+    assert output_path.read_text(encoding="utf-8") == "existing\n"
+
+
+def test_export_report_to_file_allows_workspace_internal_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    output_path = workspace / "reports" / "security-report.md"
+    workspace.mkdir()
+
+    result = export_report_to_file(
+        report_content="workspace report",
+        output_path=str(output_path),
+        allowed_base_path=str(workspace),
+    )
+
+    assert "리포트 저장 완료" in result
+    assert output_path.read_text(encoding="utf-8") == "workspace report\n"
+
+
+def test_export_report_to_file_rejects_workspace_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside_path = tmp_path / "outside" / "security-report.md"
+    workspace.mkdir()
+
+    result = export_report_to_file(
+        report_content="outside report",
+        output_path=str(outside_path),
+        allowed_base_path=str(workspace),
+    )
+
+    assert result.startswith("오류: 리포트는 허용된 workspace 내부에만 저장할 수 있습니다")
+    assert not outside_path.exists()
+
+
+def test_export_report_to_file_rejects_parent_traversal_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_path = workspace / ".." / "security-report.md"
+
+    result = export_report_to_file(
+        report_content="escaped report",
+        output_path=str(output_path),
+        allowed_base_path=str(workspace),
+    )
+
+    assert result.startswith("오류: 리포트는 허용된 workspace 내부에만 저장할 수 있습니다")
+    assert not (tmp_path / "security-report.md").exists()
