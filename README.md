@@ -70,6 +70,33 @@
 - 업로드/경로 탈출 위험
 - 디버그 모드, `.gitignore`, 프레임워크별 대표 설정 실수
 
+### `security_check`
+
+정적 점검, OpenAPI 문서 점검, 라이브 점검, 공격 표면 점검, 인증 기반 권한 점검을 한 번에 실행합니다.
+
+주요 입력:
+
+- `base_path`: 정적 점검할 프로젝트 경로
+- `target_url`: 라이브/공격 표면 점검할 배포 URL
+- `openapi_url`: 직접 지정한 OpenAPI/Swagger JSON 문서 URL
+- `bearer_token`, `session_cookie`, `extra_headers`: 일반 사용자 인증 정보
+- `output_path`: 통합 리포트 저장 경로
+- `allowed_base_path`: 저장 허용 workspace 경로
+
+### `check_openapi_security`
+
+OpenAPI/Swagger 문서를 탐색하거나 직접 읽어서 API 구조 기반 보안 위험 신호를 점검합니다.
+
+주요 점검:
+
+- 공개 OpenAPI/Swagger 문서 노출
+- 전체 API 경로와 메서드 분포
+- 관리자, 내부, 결제, 환불, 주문, 쿠폰, 파일, 웹훅 관련 endpoint 후보
+- `{userId}`, `{orderId}`, `{fileId}` 같은 IDOR 후보 path parameter
+- `role`, `isAdmin`, `userId`, `ownerId`, `price`, `amount`, `status`, `discount`, `quantity` 같은 위험 입력 필드
+- 인증 요구사항이 문서상 보이지 않는 상태 변경 API
+- 비즈니스 로직 수동 검토가 필요한 endpoint 후보
+
 ### `check_live_security`
 
 배포된 URL에 실제 요청을 보내 응답을 점검합니다.
@@ -214,15 +241,25 @@ MCP 클라이언트에 등록할 때는 아래처럼 설정할 수 있습니다.
 
 ## 사용 순서
 
-1. `check_security`로 로컬 프로젝트 디렉터리를 정적 점검합니다.
-2. 배포 URL이 있으면 `check_live_security`로 실제 응답 헤더와 쿠키를 확인합니다.
-3. `check_attack_surface`로 공개 관리자 경로, 문서 경로, 순차 ID 노출 신호를 확인합니다.
-4. 테스트용 일반 사용자 계정이 있으면 `check_authenticated_flows`로 관리자 접근과 IDOR 가능성을 확인합니다.
+1. `security_check`로 가능한 점검을 한 번에 실행합니다.
+2. 세부 점검이 필요하면 `check_security`, `check_openapi_security`, `check_live_security`, `check_attack_surface`, `check_authenticated_flows`를 개별 실행합니다.
+3. 저장이 필요하면 `output_path`를 지정하거나 `export_report`를 별도로 사용합니다.
+4. Claude Code에서는 `.claude/commands/security-check.md`를 통해 `/security-check` 커스텀 명령으로 MCP 점검과 security-review 관점 검토를 함께 요청할 수 있습니다.
 
 예시 입력:
 
 ```text
+security_check(
+  base_path="/path/to/project",
+  target_url="https://example.com",
+  openapi_url="https://example.com/openapi.json",
+  bearer_token="일반 사용자 토큰",
+  output_path="/path/to/project/security-report.md",
+  overwrite=true,
+  allowed_base_path="/path/to/project"
+)
 check_security(base_path="/path/to/project", skip_test_files=true)
+check_openapi_security(target_url="https://example.com")
 check_live_security(target_url="https://example.com")
 check_attack_surface(target_url="https://example.com")
 check_authenticated_flows(

@@ -28,6 +28,30 @@ FRAMEWORK_HINTS = {
     "rails": ["config/routes.rb", "Gemfile"],
     "laravel": ["artisan", "composer.json"],
 }
+OPENAPI_CANDIDATE_PATHS = [
+    "/openapi.json",
+    "/swagger.json",
+    "/api-docs",
+    "/v3/api-docs",
+    "/docs/openapi.json",
+]
+OPENAPI_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
+STATE_CHANGING_METHODS = {"post", "put", "patch", "delete"}
+SENSITIVE_PATH_KEYWORDS = {
+    "admin", "internal", "debug", "manage", "management",
+    "payment", "payments", "refund", "refunds", "order", "orders",
+    "coupon", "coupons", "file", "files", "download", "upload",
+    "webhook", "webhooks", "invite", "invitation", "invitations",
+    "account", "accounts", "user", "users", "role", "roles",
+}
+IDOR_PARAM_KEYWORDS = {"id", "userid", "user_id", "accountid", "account_id", "orderid", "order_id", "fileid", "file_id", "documentid", "document_id", "ownerid", "owner_id"}
+RISKY_FIELD_KEYWORDS = {
+    "role", "roles", "isadmin", "is_admin", "admin", "permission", "permissions",
+    "userid", "user_id", "ownerid", "owner_id", "accountid", "account_id",
+    "price", "amount", "total", "discount", "quantity", "status",
+    "paymentstatus", "payment_status", "refundamount", "refund_amount",
+    "approved", "verified",
+}
 
 
 class IssueDefinition(dict):
@@ -495,8 +519,10 @@ def _is_test_file(path: Path) -> bool:
     )
 
 
-def _safe_read(path: Path) -> str:
+def _safe_read(path: Path, max_bytes: int = 5_000_000) -> str:
     try:
+        if path.stat().st_size > max_bytes:
+            return ""
         return path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
@@ -1017,6 +1043,7 @@ def _http_fetch(
     extra_headers: dict[str, str] | None = None,
     bearer_token: str | None = None,
     session_cookie: str | None = None,
+    max_body_bytes: int = 4096,
 ) -> tuple[int, dict[str, str], list[tuple[str, str]], str] | tuple[None, None, None, str]:
     request = Request(
         url,
@@ -1033,14 +1060,14 @@ def _http_fetch(
                 getattr(response, "status", 200),
                 dict(response.headers.items()),
                 list(response.headers.items()),
-                response.read(4096).decode("utf-8", errors="ignore"),
+                response.read(max_body_bytes).decode("utf-8", errors="ignore"),
             )
     except HTTPError as exc:
         return (
             exc.code,
             dict(exc.headers.items()),
             list(exc.headers.items()),
-            exc.read(4096).decode("utf-8", errors="ignore"),
+            exc.read(max_body_bytes).decode("utf-8", errors="ignore"),
         )
     except URLError as exc:
         return None, None, None, str(exc.reason)
@@ -1137,6 +1164,307 @@ def _normalize_probe_headers(raw_headers: str | None) -> dict[str, str]:
         if name and value:
             normalized[name] = value
     return normalized
+
+
+def _join_url(base: str, path: str) -> str:
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _normalize_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", value.lower())
+
+
+def _is_openapi_document(data: object) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("paths"), dict) and ("openapi" in data or "swagger" in data)
+
+
+def _discover_openapi_document(
+    target_url: str,
+    openapi_url: str,
+    timeout_seconds: int,
+    extra_headers: dict[str, str],
+    bearer_token: str | None,
+    session_cookie: str | None,
+) -> tuple[str | None, dict | None, list[str], str | None]:
+    candidate_urls: list[str] = []
+    if openapi_url:
+        candidate_urls.append(openapi_url)
+    elif target_url:
+        parsed = urlparse(target_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None, None, [], f"오류: 유효한 URL이 아닙니다 - {target_url}"
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        candidate_urls.extend(_join_url(base, path) for path in OPENAPI_CANDIDATE_PATHS)
+    else:
+        return None, None, [], "오류: OpenAPI 점검에는 target_url 또는 openapi_url 중 하나가 필요합니다."
+
+    attempted: list[str] = []
+    for candidate_url in candidate_urls:
+        attempted.append(candidate_url)
+        status_code, headers, _, body = _http_fetch(
+            candidate_url,
+            method="GET",
+            timeout_seconds=timeout_seconds,
+            extra_headers=extra_headers,
+            bearer_token=bearer_token,
+            session_cookie=session_cookie,
+            max_body_bytes=1_000_000,
+        )
+        if status_code is None or headers is None:
+            continue
+        if status_code != 200:
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if _is_openapi_document(data):
+            return candidate_url, data, attempted, None
+
+    return None, None, attempted, "오류: OpenAPI/Swagger 문서를 찾지 못했습니다."
+
+
+def _operation_security(operation: dict, document: dict) -> object:
+    if "security" in operation:
+        return operation.get("security")
+    return document.get("security")
+
+
+def _has_no_declared_auth(operation: dict, document: dict) -> bool:
+    security = _operation_security(operation, document)
+    return security is None or security == []
+
+
+def _collect_schema_property_names(schema: object, document: dict, seen_refs: set[str] | None = None) -> set[str]:
+    if seen_refs is None:
+        seen_refs = set()
+    if not isinstance(schema, dict):
+        return set()
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen_refs:
+            return set()
+        seen_refs.add(ref)
+        prefix = "#/components/schemas/"
+        if ref.startswith(prefix):
+            target: object = document.get("components", {}).get("schemas", {}).get(ref.removeprefix(prefix), {})
+            return _collect_schema_property_names(target, document, seen_refs)
+        return set()
+
+    names: set[str] = set()
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        names.update(str(name) for name in properties)
+        for child in properties.values():
+            names.update(_collect_schema_property_names(child, document, seen_refs))
+
+    for keyword in ["allOf", "anyOf", "oneOf"]:
+        variants = schema.get(keyword)
+        if isinstance(variants, list):
+            for variant in variants:
+                names.update(_collect_schema_property_names(variant, document, seen_refs))
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        names.update(_collect_schema_property_names(items, document, seen_refs))
+
+    return names
+
+
+def _collect_operation_fields(operation: dict, document: dict) -> set[str]:
+    fields: set[str] = set()
+    parameters = operation.get("parameters")
+    if isinstance(parameters, list):
+        for parameter in parameters:
+            if isinstance(parameter, dict) and isinstance(parameter.get("name"), str):
+                fields.add(parameter["name"])
+
+    request_body = operation.get("requestBody")
+    if isinstance(request_body, dict):
+        content = request_body.get("content")
+        if isinstance(content, dict):
+            for media in content.values():
+                if isinstance(media, dict):
+                    fields.update(_collect_schema_property_names(media.get("schema"), document))
+
+    return fields
+
+
+def _format_openapi_findings(findings: list[dict]) -> str:
+    if not findings:
+        return "발견된 이슈 없음"
+    lines: list[str] = []
+    for finding in findings:
+        lines.extend([
+            f"- 이슈: {finding['label']} [{finding['severity']}]",
+            f"  위치: {finding['endpoint']}",
+            f"  근거: {finding['detail']}",
+            f"  공격자 관점: {finding['attack']}",
+            f"  확인할 일: {finding['fix']}",
+            "",
+        ])
+    return "\n".join(lines).strip()
+
+
+def analyze_openapi_security(
+    target_url: str = "",
+    openapi_url: str = "",
+    bearer_token: str | None = None,
+    session_cookie: str | None = None,
+    extra_headers: str | None = None,
+    timeout_seconds: int = 10,
+) -> str:
+    manual_headers = _normalize_probe_headers(extra_headers)
+    document_url, document, attempted, error = _discover_openapi_document(
+        target_url=target_url,
+        openapi_url=openapi_url,
+        timeout_seconds=timeout_seconds,
+        extra_headers=manual_headers,
+        bearer_token=bearer_token,
+        session_cookie=session_cookie,
+    )
+    if error or document is None or document_url is None:
+        attempted_text = "\n".join(f"- {url}" for url in attempted) if attempted else "- 시도한 문서 URL 없음"
+        return "\n".join([
+            error or "오류: OpenAPI/Swagger 문서를 읽지 못했습니다.",
+            "",
+            "시도한 문서 URL:",
+            attempted_text,
+        ]).strip()
+
+    paths = document.get("paths") or {}
+    findings: list[dict] = []
+    endpoint_count = 0
+    method_counter: Counter[str] = Counter()
+    sensitive_endpoints: list[str] = []
+
+    if not openapi_url and not (bearer_token or session_cookie or extra_headers):
+        findings.append({
+            "severity": "MEDIUM",
+            "label": "OpenAPI 문서 공개 노출",
+            "endpoint": document_url,
+            "detail": "인증 정보 없이 OpenAPI/Swagger 문서가 조회됐습니다.",
+            "attack": "공격자는 API 목록, 파라미터, 민감 기능명을 빠르게 수집할 수 있습니다.",
+            "fix": "운영 문서 공개가 필요한지 검토하고, 필요 없으면 인증 또는 IP 제한을 적용하세요.",
+        })
+
+    for path, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        path_params = [match.strip("{}") for match in re.findall(r"\{[^}]+\}", str(path))]
+        normalized_path = str(path).lower()
+        path_tokens = {_normalize_identifier(part) for part in re.split(r"[/_\-.{}]+", str(path)) if part}
+        path_is_sensitive = bool(path_tokens & SENSITIVE_PATH_KEYWORDS)
+
+        for method, operation in path_item.items():
+            if method.lower() not in OPENAPI_METHODS or not isinstance(operation, dict):
+                continue
+            method_lower = method.lower()
+            method_upper = method_lower.upper()
+            endpoint = f"{method_upper} {path}"
+            endpoint_count += 1
+            method_counter[method_upper] += 1
+
+            fields = _collect_operation_fields(operation, document)
+            normalized_fields = {_normalize_identifier(field) for field in fields}
+            normalized_path_params = {_normalize_identifier(param) for param in path_params}
+            risky_fields = sorted(field for field in fields if _normalize_identifier(field) in RISKY_FIELD_KEYWORDS)
+            idor_params = sorted(param for param in path_params if _normalize_identifier(param) in IDOR_PARAM_KEYWORDS or _normalize_identifier(param).endswith("id"))
+            no_auth = _has_no_declared_auth(operation, document)
+            is_state_changing = method_lower in STATE_CHANGING_METHODS
+
+            if path_is_sensitive:
+                sensitive_endpoints.append(endpoint)
+                severity = "HIGH" if any(token in normalized_path for token in ["/admin", "/internal", "/debug"]) else "MEDIUM"
+                findings.append({
+                    "severity": severity,
+                    "label": "OpenAPI 민감 엔드포인트 후보",
+                    "endpoint": endpoint,
+                    "detail": f"경로에 민감 키워드가 포함되어 있습니다: {', '.join(sorted(path_tokens & SENSITIVE_PATH_KEYWORDS))}",
+                    "attack": "공격자는 이 API를 우선 분석해 관리자 기능, 결제/환불, 파일, 웹훅 흐름을 노립니다.",
+                    "fix": "인증, 역할 검증, 소유자 검증, 감사 로그가 서버에서 강제되는지 확인하세요.",
+                })
+
+            if idor_params:
+                findings.append({
+                    "severity": "HIGH",
+                    "label": "OpenAPI IDOR 후보",
+                    "endpoint": endpoint,
+                    "detail": f"path parameter가 리소스 식별자로 보입니다: {', '.join(idor_params)}",
+                    "attack": "공격자는 ID 값을 바꿔 다른 사용자 리소스 조회, 수정, 삭제를 시도할 수 있습니다.",
+                    "fix": "해당 API가 현재 사용자와 리소스 소유자를 함께 검증하는지 코드와 동적 테스트로 확인하세요.",
+                })
+
+            if risky_fields:
+                findings.append({
+                    "severity": "HIGH",
+                    "label": "OpenAPI 위험 입력 필드 후보",
+                    "endpoint": endpoint,
+                    "detail": f"요청 필드에 권한/금액/상태 변조 후보가 있습니다: {', '.join(risky_fields)}",
+                    "attack": "공격자는 role, userId, amount, status 같은 값을 바꿔 권한 상승이나 금액 조작을 시도합니다.",
+                    "fix": "클라이언트 입력을 신뢰하지 말고 서버 계산값, 인증 컨텍스트, 상태 전이 검증을 사용하세요.",
+                })
+
+            if is_state_changing and no_auth:
+                findings.append({
+                    "severity": "HIGH" if path_is_sensitive or risky_fields or idor_params else "MEDIUM",
+                    "label": "OpenAPI 인증 없는 상태 변경 API 가능성",
+                    "endpoint": endpoint,
+                    "detail": "OpenAPI 문서 기준 security 요구사항이 보이지 않는 상태 변경 메서드입니다.",
+                    "attack": "공격자는 인증 없이 데이터 생성, 수정, 삭제 또는 중요 작업 실행을 시도할 수 있습니다.",
+                    "fix": "문서와 실제 서버 코드에서 인증/인가가 강제되는지 확인하세요. 문서 누락이면 명세도 수정하세요.",
+                })
+
+            if is_state_changing and (normalized_fields & RISKY_FIELD_KEYWORDS or normalized_path_params & IDOR_PARAM_KEYWORDS):
+                findings.append({
+                    "severity": "MEDIUM",
+                    "label": "OpenAPI 비즈니스 로직 수동 검토 후보",
+                    "endpoint": endpoint,
+                    "detail": "상태 변경 API가 리소스 식별자 또는 권한/금액/상태 필드를 다룹니다.",
+                    "attack": "공격자는 중복 요청, 순서 우회, 값 변조로 결제/주문/권한 흐름을 흔들 수 있습니다.",
+                    "fix": "중복 요청 방지, 상태 전이 검증, 서버 측 재계산, 소유자 검증을 수동 리뷰하세요.",
+                })
+
+    findings = _deduplicate_findings([
+        {
+            "group": "openapi",
+            "severity": finding["severity"],
+            "label": finding["label"],
+            "file": finding["endpoint"],
+            "line": 0,
+            "snippet": finding["detail"],
+            **finding,
+        }
+        for finding in findings
+    ])
+    findings.sort(key=lambda item: (-SEVERITY_ORDER.get(item["severity"], 0), item["endpoint"], item["label"]))
+    severity_counter = Counter(finding["severity"] for finding in findings)
+    release_status, release_reason = _calculate_release_decision(findings)
+    method_text = ", ".join(f"{method}={count}" for method, count in sorted(method_counter.items())) or "없음"
+
+    sections = [
+        "# OpenAPI 보안 점검 리포트",
+        f"- 문서 URL: {document_url}",
+        f"- API 경로 수: {len(paths)}개",
+        f"- endpoint 수: {endpoint_count}개",
+        f"- 메서드 분포: {method_text}",
+        f"- 민감 endpoint 후보 수: {len(set(sensitive_endpoints))}개",
+        f"- 감지 이슈 수: CRITICAL={severity_counter.get('CRITICAL', 0)}, HIGH={severity_counter.get('HIGH', 0)}, MEDIUM={severity_counter.get('MEDIUM', 0)}, LOW={severity_counter.get('LOW', 0)}",
+        f"- 출시 판정: {release_status}",
+        "",
+        "## 한눈에 보기",
+        release_reason,
+        "",
+        "## 발견된 OpenAPI 위험 신호",
+        _format_openapi_findings(findings[:30]),
+        "",
+        "## 주의",
+        "이 점검은 OpenAPI 문서에 드러난 API 구조를 분석합니다.",
+        "문서가 실제 서버 동작과 다르거나 보안 요구사항이 문서에 누락되어 있으면 결과가 달라질 수 있습니다.",
+        "권한 검증, 결제/환불/쿠폰 같은 비즈니스 로직은 코드 리뷰와 테스트 계정 기반 동적 검증이 추가로 필요합니다.",
+    ]
+    return "\n".join(sections).strip()
 
 
 def analyze_attack_surface(target_url: str, timeout_seconds: int = 10) -> str:
@@ -1462,6 +1790,99 @@ def export_report_to_file(
     return f"리포트 저장 완료: {destination}"
 
 
+def run_security_check(
+    base_path: str = "",
+    target_url: str = "",
+    openapi_url: str = "",
+    skip_test_files: bool = True,
+    bearer_token: str = "",
+    session_cookie: str = "",
+    extra_headers: str = "",
+    reference_user_id: str = "1",
+    alternate_user_id: str = "2",
+    timeout_seconds: int = 10,
+    output_path: str = "",
+    overwrite: bool = False,
+    allowed_base_path: str = "",
+) -> str:
+    if not base_path and not target_url and not openapi_url:
+        return "오류: 통합 보안 점검에는 base_path, target_url, openapi_url 중 하나 이상이 필요합니다."
+
+    sections = [
+        "# 통합 보안 점검 리포트",
+        "",
+        "## 실행한 점검",
+        f"- 정적 코드 점검: {'실행' if base_path else '건너뜀'}",
+        f"- OpenAPI 문서 점검: {'실행' if target_url or openapi_url else '건너뜀'}",
+        f"- 라이브 응답 점검: {'실행' if target_url else '건너뜀'}",
+        f"- 공개 공격 표면 점검: {'실행' if target_url else '건너뜀'}",
+        f"- 인증 기반 권한 점검: {'실행' if target_url and (bearer_token or session_cookie or extra_headers) else '건너뜀'}",
+    ]
+
+    if base_path:
+        sections.extend([
+            "",
+            "---",
+            "",
+            analyze_project(base_path=base_path, skip_test_files=skip_test_files),
+        ])
+
+    if target_url or openapi_url:
+        sections.extend([
+            "",
+            "---",
+            "",
+            analyze_openapi_security(
+                target_url=target_url,
+                openapi_url=openapi_url,
+                bearer_token=bearer_token or None,
+                session_cookie=session_cookie or None,
+                extra_headers=extra_headers or None,
+                timeout_seconds=timeout_seconds,
+            ),
+        ])
+
+    if target_url:
+        sections.extend([
+            "",
+            "---",
+            "",
+            analyze_live_service(target_url=target_url, timeout_seconds=timeout_seconds),
+            "",
+            "---",
+            "",
+            analyze_attack_surface(target_url=target_url, timeout_seconds=timeout_seconds),
+        ])
+
+        if bearer_token or session_cookie or extra_headers:
+            sections.extend([
+                "",
+                "---",
+                "",
+                analyze_authenticated_flows(
+                    target_url=target_url,
+                    bearer_token=bearer_token or None,
+                    session_cookie=session_cookie or None,
+                    extra_headers=extra_headers or None,
+                    reference_user_id=reference_user_id,
+                    alternate_user_id=alternate_user_id,
+                    timeout_seconds=timeout_seconds,
+                ),
+            ])
+
+    report = "\n".join(sections).strip()
+    if output_path:
+        save_result = export_report_to_file(
+            report_content=report,
+            output_path=output_path,
+            overwrite=overwrite,
+            allowed_base_path=allowed_base_path,
+        )
+        report = "\n\n".join([report, "## 리포트 저장 결과", save_result])
+
+    return report
+
+
 def register_security_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def check_security(base_path: str, skip_test_files: bool = True) -> str:
@@ -1542,6 +1963,77 @@ def register_security_tools(mcp: FastMCP) -> None:
             extra_headers=extra_headers or None,
             reference_user_id=reference_user_id,
             alternate_user_id=alternate_user_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool()
+    def security_check(
+        base_path: str = "",
+        target_url: str = "",
+        openapi_url: str = "",
+        skip_test_files: bool = True,
+        bearer_token: str = "",
+        session_cookie: str = "",
+        extra_headers: str = "",
+        reference_user_id: str = "1",
+        alternate_user_id: str = "2",
+        timeout_seconds: int = 10,
+        output_path: str = "",
+        overwrite: bool = False,
+        allowed_base_path: str = "",
+    ) -> str:
+        """
+        정적 점검, OpenAPI 문서 점검, 라이브 점검, 공격 표면 점검, 인증 기반 권한 점검을 한 번에 실행한다.
+        """
+        return run_security_check(
+            base_path=base_path,
+            target_url=target_url,
+            openapi_url=openapi_url,
+            skip_test_files=skip_test_files,
+            bearer_token=bearer_token,
+            session_cookie=session_cookie,
+            extra_headers=extra_headers,
+            reference_user_id=reference_user_id,
+            alternate_user_id=alternate_user_id,
+            timeout_seconds=timeout_seconds,
+            output_path=output_path,
+            overwrite=overwrite,
+            allowed_base_path=allowed_base_path,
+        )
+
+    @mcp.tool()
+    def check_openapi_security(
+        target_url: str = "",
+        openapi_url: str = "",
+        bearer_token: str = "",
+        session_cookie: str = "",
+        extra_headers: str = "",
+        timeout_seconds: int = 10,
+    ) -> str:
+        """
+        OpenAPI/Swagger 문서를 탐색하거나 직접 읽어 API 구조 기반 보안 위험 신호를 점검한다.
+
+        Parameters
+        ----------
+        target_url : str
+            서비스 기본 URL. openapi_url이 없으면 후보 문서 경로를 자동 탐색한다.
+        openapi_url : str
+            직접 지정한 OpenAPI/Swagger JSON 문서 URL
+        bearer_token : str
+            문서 조회에 필요한 Bearer 토큰
+        session_cookie : str
+            문서 조회에 필요한 Cookie 헤더 값
+        extra_headers : str
+            추가 헤더. 줄바꿈 기준으로 `Header: value` 형식
+        timeout_seconds : int
+            요청 타임아웃
+        """
+        return analyze_openapi_security(
+            target_url=target_url,
+            openapi_url=openapi_url,
+            bearer_token=bearer_token or None,
+            session_cookie=session_cookie or None,
+            extra_headers=extra_headers or None,
             timeout_seconds=timeout_seconds,
         )
 

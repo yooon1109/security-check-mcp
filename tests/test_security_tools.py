@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -6,8 +7,10 @@ from src.tools.security_tools import (
     analyze_attack_surface,
     analyze_authenticated_flows,
     analyze_live_service,
+    analyze_openapi_security,
     analyze_project,
     export_report_to_file,
+    run_security_check,
 )
 
 
@@ -203,6 +206,66 @@ class _AuthenticatedFlowHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/openapi.json":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        document = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/admin/users/{userId}/role": {
+                    "patch": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "role": {"type": "string"},
+                                            "isAdmin": {"type": "boolean"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "ok"}},
+                    }
+                },
+                "/api/refunds": {
+                    "post": {
+                        "security": [{"bearerAuth": []}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "orderId": {"type": "string"},
+                                            "amount": {"type": "number"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "ok"}},
+                    }
+                },
+            },
+        }
+        body = json.dumps(document).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        return
+
+
 def test_analyze_live_service_reports_header_and_cookie_issues() -> None:
     server = HTTPServer(("127.0.0.1", 0), _LiveSecurityHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -245,6 +308,51 @@ def test_analyze_attack_surface_returns_error_when_unreachable() -> None:
     report = analyze_attack_surface("http://127.0.0.1:9", timeout_seconds=1)
 
     assert report.startswith("오류: 공격 표면 점검을 수행하지 못했습니다")
+
+
+def test_analyze_openapi_security_reports_api_risks() -> None:
+    server = HTTPServer(("127.0.0.1", 0), _OpenAPIHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+
+    try:
+        report = analyze_openapi_security(target_url=url, timeout_seconds=2)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert "OpenAPI 보안 점검 리포트" in report
+    assert "OpenAPI 문서 공개 노출" in report
+    assert "OpenAPI 민감 엔드포인트 후보" in report
+    assert "OpenAPI IDOR 후보" in report
+    assert "OpenAPI 위험 입력 필드 후보" in report
+    assert "OpenAPI 인증 없는 상태 변경 API 가능성" in report
+    assert "PATCH /api/admin/users/{userId}/role" in report
+    assert "POST /api/refunds" in report
+
+
+def test_analyze_openapi_security_uses_direct_document_url() -> None:
+    server = HTTPServer(("127.0.0.1", 0), _OpenAPIHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    openapi_url = f"http://127.0.0.1:{server.server_port}/openapi.json"
+
+    try:
+        report = analyze_openapi_security(openapi_url=openapi_url, timeout_seconds=2)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert f"- 문서 URL: {openapi_url}" in report
+    assert "endpoint 수: 2개" in report
+
+
+def test_analyze_openapi_security_reports_missing_document() -> None:
+    report = analyze_openapi_security(target_url="http://127.0.0.1:9", timeout_seconds=1)
+
+    assert report.startswith("오류: OpenAPI/Swagger 문서를 찾지 못했습니다")
+    assert "/openapi.json" in report
 
 
 def test_analyze_authenticated_flows_reports_admin_access_and_idor() -> None:
@@ -352,3 +460,56 @@ def test_export_report_to_file_rejects_parent_traversal_escape(tmp_path: Path) -
 
     assert result.startswith("오류: 리포트는 허용된 workspace 내부에만 저장할 수 있습니다")
     assert not (tmp_path / "security-report.md").exists()
+
+
+def test_run_security_check_requires_target() -> None:
+    report = run_security_check()
+
+    assert report.startswith("오류: 통합 보안 점검에는")
+
+
+def test_run_security_check_combines_static_report(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+
+    report = run_security_check(base_path=str(tmp_path))
+
+    assert "# 통합 보안 점검 리포트" in report
+    assert "- 정적 코드 점검: 실행" in report
+    assert "- 라이브 응답 점검: 건너뜀" in report
+    assert "# 보안 점검 리포트" in report
+
+
+def test_run_security_check_exports_combined_report(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".gitignore").write_text(".env\n", encoding="utf-8")
+    output_path = workspace / "security-report.md"
+
+    report = run_security_check(
+        base_path=str(workspace),
+        output_path=str(output_path),
+        allowed_base_path=str(workspace),
+    )
+
+    assert "## 리포트 저장 결과" in report
+    assert "리포트 저장 완료" in report
+    assert output_path.exists()
+    assert "# 통합 보안 점검 리포트" in output_path.read_text(encoding="utf-8")
+
+
+def test_run_security_check_accepts_openapi_url_only() -> None:
+    server = HTTPServer(("127.0.0.1", 0), _OpenAPIHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    openapi_url = f"http://127.0.0.1:{server.server_port}/openapi.json"
+
+    try:
+        report = run_security_check(openapi_url=openapi_url, timeout_seconds=2)
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert "- OpenAPI 문서 점검: 실행" in report
+    assert "- 라이브 응답 점검: 건너뜀" in report
+    assert "OpenAPI 보안 점검 리포트" in report
